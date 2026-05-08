@@ -1,0 +1,11 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="../IntegrationModule/IntegrationModule.vcxproj" Id="375f99a6-5d33-4391-b1aa-2d1de9b08b91" />
+  <Project Path="../Logic Simulator/Logic Simulator.vcxproj" Id="f0f3ffe2-6c21-4b2e-b601-7a21632b929b" />
+  <Project Path="../Modules Template/Modules Template.vcxproj" Id="23cb6100-9ac1-4dcb-99ad-be118ad3391a" />
+  <Project Path="../Secret Sharing Lagrange Visualizer Module/Secret Sharing Lagrange Visualizer Module.vcxproj" Id="9c3ed01c-3bf7-42dd-8ce8-2ea381d63f4e" />
+  <Project Path="Project1.vcxproj" Id="19a474fe-0485-4664-9f3d-97b665c91187" />
+</Solution>

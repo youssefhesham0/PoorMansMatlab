@@ -1,0 +1,8 @@
+# Ignore all Rust build artifacts
+target/
+*/target/
+**/*.rs.bk
+
+# Ignore OS files
+.DS_Store
+Thumbs.db/target

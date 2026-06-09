@@ -1,5 +1,5 @@
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints, Polygon};
+use egui_plot::{Line, Plot, PlotPoints}; // Removed unused Polygon warning
 use egui_snarl::{InPin, OutPin, Snarl};
 use egui_snarl::ui::{PinInfo, SnarlViewer, SnarlStyle};
 use std::collections::HashMap;
@@ -8,23 +8,114 @@ use std::path::Path;
 use wasmtime::*;
 use serde::{Serialize, Deserialize};
 
-// --- LOGIC STUDIO (V3) STRUCTS ---
+// ========================================================================================
+// THE UNIVERSAL HOST ENGINE: ARCHITECTURE MANIFESTO
+// Core Focus: A "Dumb Terminal" Wasm Shell and Universal GPU Renderer
+// ========================================================================================
+//
+// === THE PRIME DIRECTIVE: THE BLIND PAINTER ===
+// This engine knows NOTHING about the domain of the modules it runs. It does not know 
+// what a MANET, a Logic Gate, or a Cryptographic Hash is. It is strictly an execution 
+// environment and a rendering pipeline. 
+// IF YOU ARE ADDING DOMAIN-SPECIFIC LOGIC TO THIS FILE, YOU ARE BREAKING THE ARCHITECTURE.
+//
+// === THE I/O PIPELINE ===
+// 1. INPUT: The Host captures user interactions (mouse X/Y, clicks, text input) and 
+//    packages them into a generic JSON state dictionary.
+// 2. EXECUTION: The Host passes this JSON into the loaded Wasm Cartridge's memory buffer.
+// 3. OUTPUT: The Wasm Cartridge computes the physics/logic and returns a JSON "blueprint".
+// 4. RENDER: The Host parses the blueprint and draws the requested generic primitives.
+//
+// === SUPPORTED RENDER ARCHETYPES (THE API) ===
+// The Wasm blueprint dictates the layout. The Host currently supports:
+// - "dashboard": A generic UI layout for sliders, text inputs, and 2D Plotting (egui_plot).
+// - "tabbed_studio": A multi-tab interface for complex modules.
+//      -> Tab Type "text": Renders raw strings (e.g., Verilog code, TCL scripts, Tables).
+//      -> Tab Type "node_graph": Renders an interactive node-based UI (egui_snarl).
+//      -> Tab Type "custom_canvas": A pure 2D GPU painter. Reads a `draw_list` of generic 
+//         shapes (circle, line, text, arrow) and renders them exactly at the given X/Y.
+//
+// === FUTURE EXPANSION: THE 3D SCENE ===
+// When 3D is required, we will add a "3d_scene" tab type here. The Host Engine will 
+// handle the native camera panning, zooming, and 3D projection rendering. Wasm cartridges 
+// will simply pass arrays of (X, Y, Z) coordinates, radii, and colors.
+//
+// === THE GOLDEN RULES ===
+// Write it once, run any module.
+// This is based on "Global" if else design, never delete something before asking
+// ========================================================================================
+
+// --- UNIVERSAL NODE GRAPH STRUCTS ---
 #[derive(Clone, Serialize, Deserialize)]
-struct DumbNode { name: String, inputs: Vec<String>, outputs: Vec<String> }
-struct DumbViewer;
+struct DumbNode { 
+    name: String, 
+    inputs: Vec<String>, 
+    outputs: Vec<String>,
+    
+    // --- NEW: GENERIC UI PAYLOADS ---
+    #[serde(default)]
+    show_toggle: bool,
+    #[serde(default)]
+    toggle_state: bool,
+    
+    #[serde(default)]
+    show_text_input: bool,
+    #[serde(default)]
+    custom_text: String,
+}
+
+struct DumbViewer {
+    pub trigger_update: bool, // Tells the Host to re-fire Wasm when a user clicks something
+}
+
 impl SnarlViewer<DumbNode> for DumbViewer {
-    fn title(&mut self, node: &DumbNode) -> String { node.name.clone() }
+    fn title(&mut self, node: &DumbNode) -> String { 
+        if node.show_text_input && !node.custom_text.is_empty() {
+            format!("{} ({})", node.name, node.custom_text)
+        } else {
+            node.name.clone()
+        }
+    }
+    
     fn inputs(&mut self, node: &DumbNode) -> usize { node.inputs.len() }
     fn outputs(&mut self, node: &DumbNode) -> usize { node.outputs.len() }
+    
+    // RENDER GENERIC NODE UI (Checkboxes & Text Inputs)
+    fn show_header(&mut self, node: egui_snarl::NodeId, inputs: &[InPin], outputs: &[OutPin], ui: &mut egui::Ui, scale: f32, snarl: &mut Snarl<DumbNode>) {
+        let n = &mut snarl[node];
+        ui.horizontal(|ui| {
+            if n.show_toggle {
+                if ui.checkbox(&mut n.toggle_state, "").changed() {
+                    self.trigger_update = true; // Instantly recalculate!
+                }
+            }
+            if n.show_text_input {
+                let prev_text = n.custom_text.clone();
+                ui.add(egui::TextEdit::singleline(&mut n.custom_text).desired_width(50.0));
+                if prev_text != n.custom_text {
+                    self.trigger_update = true; // Instantly recalculate!
+                }
+            }
+            ui.label(self.title(n));
+        });
+    }
+
     fn show_input(&mut self, pin: &InPin, ui: &mut egui::Ui, _scale: f32, snarl: &mut Snarl<DumbNode>) -> PinInfo {
-        ui.label(&snarl[pin.id.node].inputs[pin.id.input]); PinInfo::circle().with_fill(egui::Color32::GREEN)
+        ui.label(&snarl[pin.id.node].inputs[pin.id.input]); 
+        PinInfo::circle().with_fill(egui::Color32::GRAY)
     }
+    
     fn show_output(&mut self, pin: &OutPin, ui: &mut egui::Ui, _scale: f32, snarl: &mut Snarl<DumbNode>) -> PinInfo {
-        ui.label(&snarl[pin.id.node].outputs[pin.id.output]); PinInfo::circle().with_fill(egui::Color32::RED)
+        ui.label(&snarl[pin.id.node].outputs[pin.id.output]); 
+        
+        // GENERIC VISUAL FEEDBACK: If the module says this node is "active" (toggle_state = true), make it green!
+        let color = if snarl[pin.id.node].toggle_state { egui::Color32::GREEN } else { egui::Color32::RED };
+        PinInfo::circle().with_fill(color)
     }
+    
     fn has_node_menu(&mut self, _node: &DumbNode) -> bool { true }
     fn show_node_menu(&mut self, node: egui_snarl::NodeId, _inputs: &[InPin], _outputs: &[OutPin], ui: &mut egui::Ui, _scale: f32, snarl: &mut Snarl<DumbNode>) {
-        if ui.button("🗑 Delete Node").clicked() { snarl.remove_node(node); ui.close_menu(); }
+        if ui.button("🗑 Delete Node").clicked() { snarl.remove_node(node); self.trigger_update = true; ui.close_menu(); }
     }
 }
 
@@ -60,11 +151,27 @@ impl eframe::App for HostEngineApp {
             
             let modules = self.loaded_modules.clone();
             for mod_name in &modules {
-                if ui.selectable_label(self.selected_module.as_ref() == Some(mod_name), mod_name).clicked() {
-                    self.selected_module = Some(mod_name.clone());
-                    self.user_inputs.clear(); self.snarl = Snarl::new(); self.active_tab_id.clear(); trigger_wasm = true; 
-                }
-            }
+                            if ui.selectable_label(self.selected_module.as_ref() == Some(mod_name), mod_name).clicked() {
+                                self.selected_module = Some(mod_name.clone());
+                                self.user_inputs.clear(); self.snarl = Snarl::new(); self.active_tab_id.clear(); 
+                                
+                                // --- NEW: STATE HYDRATION (Load custom ICs) ---
+                                let base_name = mod_name.trim_end_matches(".wasm");
+                                let data_dir = Path::new("modules").join(format!("{}_data", base_name));
+                                if let Ok(entries) = fs::read_dir(data_dir) {
+                                    for entry in entries.flatten() {
+                                        if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                                            if let Ok(content) = fs::read_to_string(entry.path()) {
+                                                let filename = entry.file_name().to_string_lossy().to_string();
+                                                self.user_inputs.insert(format!("ic_{}", filename), content);
+                                            }
+                                        }
+                                    }
+                                }
+                                // ----------------------------------------------
+                                trigger_wasm = true; 
+                            }
+                        }
             ui.add_space(20.0); ui.label(egui::RichText::new(&self.status).color(egui::Color32::GRAY));
         });
 
@@ -188,8 +295,9 @@ impl eframe::App for HostEngineApp {
                             }
                         });
                 }
+
                 // =========================================================
-                // SHAPE 2: THE TABBED STUDIO (Logic Module & Future MANET)
+                // SHAPE 2: THE TABBED STUDIO
                 // =========================================================
                 else if layout_kind == "tabbed_studio" {
                     if let Some(tabs) = blueprint.get("tabs").and_then(|t| t.as_array()) {
@@ -216,51 +324,109 @@ impl eframe::App for HostEngineApp {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { if ui.button("⚡ COMPILE GRAPH").clicked() { trigger_wasm = true; } });
                                 });
                             });
-                            egui::CentralPanel::default().show_inside(ui, |ui| { self.snarl.show(&mut DumbViewer, &SnarlStyle::new(), "snarl_canvas", ui); });
+                            egui::CentralPanel::default().show_inside(ui, |ui| { 
+    let mut viewer = DumbViewer { trigger_update: false };
+    self.snarl.show(&mut viewer, &SnarlStyle::new(), "snarl_canvas", ui); 
+    if viewer.trigger_update { trigger_wasm = true; } // Live execution!
+});
                         } 
                         else if tab_kind == "text" {
                             let text = active_tab_data["value"].as_str().unwrap_or("");
                             let mut display_text = text.to_string();
                             egui::ScrollArea::vertical().show(ui, |ui| { ui.add(egui::TextEdit::multiline(&mut display_text).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(30)); });
                         }
-                        else if tab_kind == "state_diagram" {
-                            if let (Some(states), Some(transitions)) = (active_tab_data.get("states").and_then(|s| s.as_array()), active_tab_data.get("transitions").and_then(|t| t.as_array())) {
-                                egui::ScrollArea::both().show(ui, |ui| {
-                                    let (rect, _response) = ui.allocate_exact_size(egui::vec2(800.0, 600.0), egui::Sense::hover());
-                                    let painter = ui.painter_at(rect);
-                                    let center = rect.center();
-                                    let radius = 150.0;
-                                    let mut state_positions = std::collections::HashMap::new();
-                                    for (i, state_val) in states.iter().enumerate() {
-                                        let state_str = state_val.as_str().unwrap();
-                                        let angle = (i as f32 / states.len() as f32) * std::f32::consts::TAU;
-                                        let pos = center + egui::vec2(angle.cos() * radius, angle.sin() * radius);
-                                        state_positions.insert(state_str, pos);
-                                        painter.circle_filled(pos, 40.0, egui::Color32::from_gray(40));
-                                        painter.circle_stroke(pos, 40.0, egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE));
-                                        painter.text(pos, egui::Align2::CENTER_CENTER, state_str, egui::FontId::proportional(24.0), egui::Color32::WHITE);
-                                    }
-                                    for t in transitions {
-                                        let from = t["from"].as_str().unwrap(); let to = t["to"].as_str().unwrap(); let label = t["label"].as_str().unwrap_or("");
-                                        if let (Some(&p1), Some(&p2)) = (state_positions.get(from), state_positions.get(to)) {
-                                            if from == to {
-                                                let loop_center = p1 + egui::vec2(0.0, -60.0);
-                                                painter.circle_stroke(loop_center, 20.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
-                                                painter.text(loop_center + egui::vec2(0.0, -30.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(14.0), egui::Color32::LIGHT_GREEN);
-                                            } else {
-                                                let dir = (p2 - p1).normalized();
-                                                let start_edge = p1 + dir * 40.0; let end_edge = p2 - dir * 40.0;
-                                                painter.arrow(start_edge, end_edge - start_edge, egui::Stroke::new(2.0, egui::Color32::YELLOW));
-                                                let mid_point = start_edge + (end_edge - start_edge) * 0.5;
-                                                painter.text(mid_point + egui::vec2(0.0, -15.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(14.0), egui::Color32::LIGHT_GREEN);
+                        else if tab_kind == "custom_canvas" {
+                            egui::ScrollArea::both().show(ui, |ui| {
+                                let (rect, _response) = ui.allocate_exact_size(egui::vec2(800.0, 600.0), egui::Sense::click_and_drag());
+                                let painter = ui.painter_at(rect);
+                                
+                                if let Some(bg) = active_tab_data.get("background").and_then(|b| b.as_array()) {
+                                    let color = egui::Color32::from_rgb(bg[0].as_u64().unwrap_or(0) as u8, bg[1].as_u64().unwrap_or(0) as u8, bg[2].as_u64().unwrap_or(0) as u8);
+                                    painter.rect_filled(rect, 0.0, color);
+                                }
+
+                                if let Some(draw_list) = active_tab_data.get("draw_list").and_then(|d| d.as_array()) {
+                                    for cmd in draw_list {
+                                        let shape = cmd["shape"].as_str().unwrap_or("");
+                                        
+                                        let get_color = |key: &str, default: egui::Color32| -> egui::Color32 {
+                                            if let Some(arr) = cmd.get(key).and_then(|a| a.as_array()) {
+                                                if arr.len() >= 3 {
+                                                    let a = if arr.len() == 4 { arr[3].as_u64().unwrap_or(255) as u8 } else { 255 };
+                                                    return egui::Color32::from_rgba_unmultiplied(
+                                                        arr[0].as_u64().unwrap_or(0) as u8, arr[1].as_u64().unwrap_or(0) as u8, arr[2].as_u64().unwrap_or(0) as u8, a
+                                                    );
+                                                }
+                                            }
+                                            default
+                                        };
+
+                                        if shape == "circle" {
+                                            let x = cmd["x"].as_f64().unwrap_or(0.0) as f32;
+                                            let y = cmd["y"].as_f64().unwrap_or(0.0) as f32;
+                                            let r = cmd["radius"].as_f64().unwrap_or(10.0) as f32;
+                                            let pos = rect.min + egui::vec2(x, y);
+                                            
+                                            let fill = get_color("fill", egui::Color32::TRANSPARENT);
+                                            let stroke_color = get_color("stroke", egui::Color32::TRANSPARENT);
+                                            let stroke_width = cmd["stroke_width"].as_f64().unwrap_or(0.0) as f32;
+                                            
+                                            painter.circle(pos, r, fill, egui::Stroke::new(stroke_width, stroke_color));
+                                        } 
+                                        else if shape == "text" {
+                                            let x = cmd["x"].as_f64().unwrap_or(0.0) as f32;
+                                            let y = cmd["y"].as_f64().unwrap_or(0.0) as f32;
+                                            let text = cmd["text"].as_str().unwrap_or("");
+                                            let size = cmd["size"].as_f64().unwrap_or(14.0) as f32;
+                                            let pos = rect.min + egui::vec2(x, y);
+                                            let color = get_color("color", egui::Color32::WHITE);
+                                            
+                                            painter.text(pos, egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(size), color);
+                                        }
+                                        else if shape == "arrow" || shape == "line" {
+                                            if let (Some(from), Some(to)) = (cmd.get("from").and_then(|a| a.as_array()), cmd.get("to").and_then(|a| a.as_array())) {
+                                                let p1 = rect.min + egui::vec2(from[0].as_f64().unwrap_or(0.0) as f32, from[1].as_f64().unwrap_or(0.0) as f32);
+                                                let p2 = rect.min + egui::vec2(to[0].as_f64().unwrap_or(0.0) as f32, to[1].as_f64().unwrap_or(0.0) as f32);
+                                                let color = get_color("color", egui::Color32::WHITE);
+                                                let width = cmd["width"].as_f64().unwrap_or(1.0) as f32;
+                                                
+                                                if shape == "arrow" {
+                                                    painter.arrow(p1, p2 - p1, egui::Stroke::new(width, color));
+                                                } else {
+                                                    painter.line_segment([p1, p2], egui::Stroke::new(width, color));
+                                                }
                                             }
                                         }
                                     }
-                                });
-                            }
+                                }
+                            });
+                        }
+                        else if tab_kind == "dashboard" {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add_space(10.0);
+                                let controls = active_tab_data.get("inputs").or_else(|| active_tab_data.get("controls")).and_then(|c| c.as_array());
+                                
+                                if let Some(controls) = controls {
+                                    for ctrl in controls {
+                                        let id = ctrl["id"].as_str().unwrap();
+                                        let label = ctrl.get("label").or_else(|| ctrl.get("name")).and_then(|v| v.as_str()).unwrap_or(id);
+                                        let kind = ctrl["type"].as_str().unwrap();
+                                        
+                                        let val = self.user_inputs.entry(id.to_string()).or_insert_with(|| ctrl.get("default").and_then(|d| d.as_str()).unwrap_or("").to_string());
+
+                                        ui.horizontal(|ui| {
+                                            ui.label(label);
+                                            if kind == "text" { ui.text_edit_singleline(val); } 
+                                        });
+                                    }
+                                }
+                                ui.add_space(15.0);
+                                if ui.button("⚡ Save to Disk").clicked() { trigger_wasm = true; }
+                            });
                         }
                     }
                 }
+
             } else {
                 if ui.button("⚡ Initialize Module").clicked() { trigger_wasm = true; }
             }
@@ -310,9 +476,45 @@ impl HostEngineApp {
                             let _ = memory.read(&store, ptr as usize, &mut out_bytes);
                             
                             if let Ok(json_str) = String::from_utf8(out_bytes) {
-                                self.ui_blueprint = serde_json::from_str(&json_str).ok();
-                                self.status = "Rendered successfully.".to_string();
-                                return;
+                                if let Ok(blueprint) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                                    
+                                    // --- NEW: COMMAND-DRIVEN I/O (LAZY EVALUATION) ---
+                                    if let Some(commands) = blueprint.get("host_commands").and_then(|c| c.as_array()) {
+                                        let base_name = mod_name.trim_end_matches(".wasm");
+                                        let data_dir = Path::new("modules").join(format!("{}_data", base_name));
+                                        let mut retrigger = false;
+
+                                        for cmd in commands {
+                                            let action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("");
+                                            let filename = cmd.get("filename").and_then(|f| f.as_str()).unwrap_or("data.json");
+
+                                            if action == "write" {
+                                                let _ = fs::create_dir_all(&data_dir);
+                                                if let Some(data) = cmd.get("data").and_then(|d| d.as_str()) {
+                                                    let _ = fs::write(data_dir.join(filename), data);
+                                                }
+                                            } else if action == "read" {
+                                                let input_key = format!("file_{}", filename);
+                                                if !self.user_inputs.contains_key(&input_key) {
+                                                    if let Ok(content) = fs::read_to_string(data_dir.join(filename)) {
+                                                        self.user_inputs.insert(input_key, content);
+                                                        retrigger = true; 
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        if retrigger {
+                                            self.fire_wasm();
+                                            return;
+                                        }
+                                    }
+                                    // ------------------------------------------------
+
+                                    self.ui_blueprint = Some(blueprint);
+                                    self.status = "Rendered successfully.".to_string();
+                                    return;
+                                }
                             }
                         }
                     }

@@ -1,4 +1,4 @@
-use serde_json::json;
+nuse serde_json::json;
 
 static mut BUFFER: [u8; 1024 * 1024] = [0; 1024 * 1024];
 
@@ -18,7 +18,7 @@ fn trace_math(target_node: &str, target_pin: u64, nodes: &serde_json::Map<String
             return match src_name {
                 "Input" => {
                     let txt = nodes[&src_id]["value"].get("custom_text").and_then(|v| v.as_str()).unwrap_or("");
-                    if txt.is_empty() { format!("In_{}", src_id) } else { txt.to_string() }
+                    if txt.is_empty() { "In".to_string() } else { txt.to_string() }
                 },
                 "Clock (clk)" => "clk".to_string(),
                 "NOT Gate" => format!("~{}", trace_math(&src_id, 0, nodes, wires)),
@@ -29,11 +29,11 @@ fn trace_math(target_node: &str, target_pin: u64, nodes: &serde_json::Map<String
                 "XOR Gate" => format!("({} ^ {})", trace_math(&src_id, 0, nodes, wires), trace_math(&src_id, 1, nodes, wires)),
                 "XNOR Gate" => format!("~({} ^ {})", trace_math(&src_id, 0, nodes, wires), trace_math(&src_id, 1, nodes, wires)),
                 "D-Flip Flop" => if out_pin_idx == 0 { "Q".to_string() } else { "(~Q)".to_string() },
-                _ => format!("wire_{}_Out{}", src_id, out_pin_idx), 
+                _ => format!("{}_Out{}", src_name, out_pin_idx), 
             };
         }
     }
-    "1'b0".to_string()
+    "0".to_string()
 }
 
 fn simulate_graph(
@@ -55,8 +55,12 @@ fn simulate_graph(
             return match src_name {
                 "Input" => {
                     let txt = nodes[&src_id]["value"].get("custom_text").and_then(|v| v.as_str()).unwrap_or("");
+                    // If we are inside a truth table loop or a pocket dimension, read the scope!
                     if let Some(&val) = scope.get(txt) { val } 
-                    else { nodes[&src_id]["value"].get("toggle_state").and_then(|v| v.as_bool()).unwrap_or(false) }
+                    else {
+                        // Otherwise, read the live toggle state from the Host UI!
+                        nodes[&src_id]["value"].get("toggle_state").and_then(|v| v.as_bool()).unwrap_or(false)
+                    }
                 },
                 "Clock (clk)" => false,
                 "NOT Gate" => !simulate_graph(&src_id, 0, nodes, wires, scope, q_val, global_inputs),
@@ -68,6 +72,7 @@ fn simulate_graph(
                 "XNOR Gate"=> !(simulate_graph(&src_id, 0, nodes, wires, scope, q_val, global_inputs) ^ simulate_graph(&src_id, 1, nodes, wires, scope, q_val, global_inputs)),
                 "D-Flip Flop" => if out_pin_idx == 0 { q_val } else { !q_val },
                 
+                // === THE POCKET DIMENSION ===
                 _ => {
                     let ic_key = format!("ic_{}.json", src_name);
                     if let Some(ic_json_str) = global_inputs.get(&ic_key).and_then(|v| v.as_str()) {
@@ -112,6 +117,7 @@ fn simulate_graph(
 pub extern "C" fn execute(input_len: usize) -> usize {
     let input_bytes = unsafe { std::slice::from_raw_parts(std::ptr::addr_of!(BUFFER).cast::<u8>(), input_len) };
     let state: serde_json::Value = serde_json::from_slice(input_bytes).unwrap_or_default();
+    
     let empty_json = json!({});
     let global_inputs = state.get("inputs").unwrap_or(&empty_json);
 
@@ -119,14 +125,20 @@ pub extern "C" fn execute(input_len: usize) -> usize {
     let save_name = global_inputs.get("save_name").and_then(|s| s.as_str()).unwrap_or("");
     if !save_name.is_empty() {
         if let Some(graph) = state.get("graph") {
-            host_commands.push(json!({ "action": "write", "filename": format!("{}.json", save_name), "data": serde_json::to_string(graph).unwrap_or_default() }));
+            host_commands.push(json!({
+                "action": "write",
+                "filename": format!("{}.json", save_name),
+                "data": serde_json::to_string(graph).unwrap_or_default()
+            }));
         }
     }
 
     let mut out_nodes = Vec::new();
     let mut ff_node_id = String::new();
     let mut internal_wires = Vec::new();
-    let mut verilog_statements = Vec::new();
+    let mut assign_statements = Vec::new();
+    
+    // Extract dynamic UI inputs
     let mut canvas_inputs = Vec::new();
 
     if let Some(graph) = state.get("graph") {
@@ -144,10 +156,29 @@ pub extern "C" fn execute(input_len: usize) -> usize {
             }
             canvas_inputs.sort();
 
+            let get_source = |target_node_id: &str, target_pin_idx: u64| -> String {
+                for wire in wires {
+                    let in_pin = &wire["in_pin"];
+                    if in_pin["node"].as_u64().unwrap().to_string() == target_node_id && in_pin["input"].as_u64().unwrap() == target_pin_idx {
+                        let source_id = wire["out_pin"]["node"].as_u64().unwrap().to_string();
+                        let source_name = nodes[&source_id]["value"]["name"].as_str().unwrap();
+                        let out_pin_idx = wire["out_pin"]["output"].as_u64().unwrap();
+                        return match source_name {
+                            "Input" => {
+                                let txt = nodes[&source_id]["value"].get("custom_text").and_then(|v| v.as_str()).unwrap_or("");
+                                if txt.is_empty() { format!("In_{}", source_id) } else { txt.to_string() }
+                            },
+                            "Clock (clk)" => "clk".to_string(),
+                            "D-Flip Flop" => if out_pin_idx == 0 { "Q".to_string() } else { "Q_bar".to_string() },
+                            _ => format!("wire_{}", source_id),
+                        };
+                    }
+                }
+                "1'b0".to_string()
+            };
+
             for (node_id, node_data) in nodes {
                 let name = node_data["value"]["name"].as_str().unwrap();
-                
-                // Logic Gates Verilog
                 let logic_op = match name {
                     "AND Gate" => Some("&"), "OR Gate" => Some("|"), "XOR Gate" => Some("^"),
                     "NAND Gate" => Some("~&"), "NOR Gate" => Some("~|"), "XNOR Gate" => Some("~^"), "NOT Gate" => Some("~"), _ => None,
@@ -155,58 +186,38 @@ pub extern "C" fn execute(input_len: usize) -> usize {
 
                 if let Some(op) = logic_op {
                     internal_wires.push(format!("wire_{}", node_id));
-                    let input_0 = trace_math(node_id, 0, nodes, wires);
-                    if name == "NOT Gate" { verilog_statements.push(format!("  assign wire_{} = {} {};", node_id, op, input_0)); } 
-                    else {
-                        let input_1 = trace_math(node_id, 1, nodes, wires);
-                        verilog_statements.push(format!("  assign wire_{} = {} {} {};", node_id, input_0, op, input_1));
+                    let input_0 = get_source(node_id, 0);
+                    if name == "NOT Gate" {
+                        assign_statements.push(format!("  assign wire_{} = {} {};", node_id, op, input_0));
+                    } else {
+                        let input_1 = get_source(node_id, 1);
+                        assign_statements.push(format!("  assign wire_{} = {} {} {};", node_id, input_0, op, input_1));
                     }
                 }
-                
-                // Custom IC Verilog (Instantiation)
-                if !["Input", "Module OUT", "Clock (clk)", "D-Flip Flop", "AND Gate", "OR Gate", "XOR Gate", "NAND Gate", "NOR Gate", "XNOR Gate", "NOT Gate"].contains(&name) {
-                    let mut ports = Vec::new();
-                    
-                    // Map Inputs
-                    if let Some(inputs) = node_data["value"].get("inputs").and_then(|i| i.as_array()) {
-                        for (i, in_name) in inputs.iter().enumerate() {
-                            let src_wire = trace_math(node_id, i as u64, nodes, wires);
-                            ports.push(format!(".{}({})", in_name.as_str().unwrap_or(""), src_wire));
-                        }
-                    }
-                    
-                    // Map Outputs
-                    if let Some(outputs) = node_data["value"].get("outputs").and_then(|o| o.as_array()) {
-                        for (i, out_name) in outputs.iter().enumerate() {
-                            let out_wire_name = format!("wire_{}_Out{}", node_id, i);
-                            internal_wires.push(out_wire_name.clone());
-                            ports.push(format!(".{}({})", out_name.as_str().unwrap_or(""), out_wire_name));
-                        }
-                    }
-                    verilog_statements.push(format!("  {} inst_{} ({});", name, node_id, ports.join(", ")));
-                }
-
                 if name == "D-Flip Flop" { ff_node_id = node_id.to_string(); }
-                if name == "Module OUT" { out_nodes.push(node_id.to_string()); }
+                if name == "Module OUT" { 
+                    let out_idx = out_nodes.len();
+                    out_nodes.push(node_id.to_string());
+                    assign_statements.push(format!("  assign Out_{} = {};", out_idx, get_source(node_id, 0))); 
+                }
             }
 
-            // Generate Output Labels
-            let mut out_headers: Vec<String> = Vec::new();
-            for out_id in &out_nodes {
-                let txt = nodes[out_id]["value"].get("custom_text").and_then(|v| v.as_str()).unwrap_or("");
-                out_headers.push(if txt.is_empty() { format!("Out_{}", out_id) } else { txt.to_string() });
-            }
-
+            let out_headers: Vec<String> = (0..out_nodes.len()).map(|i| format!("Out_{}", i)).collect();
             let out_header_str = if out_nodes.is_empty() { "Output".to_string() } else { out_headers.join(" | ") };
             let out_sep_str = if out_nodes.is_empty() { "------".to_string() } else { out_headers.iter().map(|_| "-------").collect::<Vec<_>>().join("|") };
+
+            let mut table_content = String::new();
             let in_header_str = if canvas_inputs.is_empty() { "Inputs".to_string() } else { canvas_inputs.join(" | ") };
             let in_sep_str = if canvas_inputs.is_empty() { "------".to_string() } else { canvas_inputs.iter().map(|_| "---").collect::<Vec<_>>().join("|") };
             
-            let mut table_content = String::from("=== DATA SIMULATION ===\n");
-            table_content.push_str(&format!(" {} || {} \n-{}--||-{}-\n", in_header_str, out_header_str, in_sep_str, out_sep_str));
+            table_content.push_str("=== DATA SIMULATION ===\n");
+            table_content.push_str(&format!(" {} || {} \n", in_header_str, out_header_str));
+            table_content.push_str(&format!("-{}--||-{}-\n", in_sep_str, out_sep_str));
             
+            // Smart Truth Table Limits
             if canvas_inputs.len() <= 4 {
-                for comb in 0..(1 << canvas_inputs.len()) {
+                let max_comb = 1 << canvas_inputs.len();
+                for comb in 0..max_comb {
                     let mut scope = std::collections::HashMap::new();
                     let mut row_ins = Vec::new();
                     for (i, in_name) in canvas_inputs.iter().enumerate() {
@@ -217,14 +228,20 @@ pub extern "C" fn execute(input_len: usize) -> usize {
                     
                     let mut out_vals = Vec::new();
                     for out_id in &out_nodes {
-                        out_vals.push(format!("  {}  ", simulate_graph(out_id, 0, nodes, wires, &scope, false, global_inputs) as u8));
+                        let out_val = simulate_graph(out_id, 0, nodes, wires, &scope, false, global_inputs);
+                        out_vals.push(format!("  {}  ", out_val as u8));
                     }
-                    table_content.push_str(&format!(" {} || {} \n", if row_ins.is_empty() { " N/A ".to_string() } else { row_ins.join(" | ") }, if out_nodes.is_empty() { " N/A ".to_string() } else { out_vals.join("|") }));
+                    let out_row_str = if out_nodes.is_empty() { " N/A ".to_string() } else { out_vals.join("|") };
+                    let in_row_str = if row_ins.is_empty() { " N/A ".to_string() } else { row_ins.join(" | ") };
+                    
+                    table_content.push_str(&format!(" {} || {} \n", in_row_str, out_row_str));
                 }
             } else {
                 table_content.push_str("\n[Truth Table hidden: > 4 inputs. Showing LIVE STATE only.]\n\n");
+                let empty_scope = std::collections::HashMap::new();
                 let mut row_ins = Vec::new();
                 for in_name in &canvas_inputs {
+                    // Extract live toggle state manually to show in table
                     let mut state_val = 0;
                     for (_, n) in nodes {
                         if n["value"]["name"].as_str().unwrap() == "Input" && n["value"].get("custom_text").and_then(|v| v.as_str()).unwrap_or("") == in_name {
@@ -235,21 +252,29 @@ pub extern "C" fn execute(input_len: usize) -> usize {
                 }
                 
                 let mut out_vals = Vec::new();
-                for out_id in &out_nodes { out_vals.push(format!("  {}  ", simulate_graph(out_id, 0, nodes, wires, &std::collections::HashMap::new(), false, global_inputs) as u8)); }
-                table_content.push_str(&format!(" {} || {} \n", if row_ins.is_empty() { " N/A ".to_string() } else { row_ins.join(" | ") }, if out_nodes.is_empty() { " N/A ".to_string() } else { out_vals.join("|") }));
+                for out_id in &out_nodes {
+                    let out_val = simulate_graph(out_id, 0, nodes, wires, &empty_scope, false, global_inputs);
+                    out_vals.push(format!("  {}  ", out_val as u8));
+                }
+                let out_row_str = if out_nodes.is_empty() { " N/A ".to_string() } else { out_vals.join("|") };
+                let in_row_str = if row_ins.is_empty() { " N/A ".to_string() } else { row_ins.join(" | ") };
+                table_content.push_str(&format!(" {} || {} \n", in_row_str, out_row_str));
             }
 
-            let in_ports_str = if canvas_inputs.is_empty() { "".to_string() } else { format!("input wire {}, ", canvas_inputs.join(", input wire ")) };
-            let out_ports_str = if out_headers.is_empty() { "".to_string() } else { format!("output wire {}", out_headers.join(", output wire ")) };
-            let comma = if !in_ports_str.is_empty() && !out_ports_str.is_empty() { ", " } else { "" };
+            let mut out_ports = Vec::new();
+            for i in 0..out_nodes.len() { out_ports.push(format!("output wire Out_{}", i)); }
             
-            let mut verilog_code = format!("module GeneratedLogic({}{}clk{}{});\n", in_ports_str, if in_ports_str.is_empty() { "input wire " } else { "" }, comma, out_ports_str);
+            let in_ports: Vec<String> = canvas_inputs.iter().map(|s| format!("input wire {}", s)).collect();
+            let in_ports_str = if in_ports.is_empty() { "".to_string() } else { format!("{}, ", in_ports.join(", ")) };
+            let out_ports_str = if out_ports.is_empty() { "".to_string() } else { format!("{}, ", out_ports.join(", ")) };
+            
+            let mut verilog_code = format!("module GeneratedLogic({}input wire clk, {});\n", in_ports_str, out_ports_str);
+            // clean up trailing comma if needed but verilog tolerates it poorly. Better:
+            verilog_code = format!("module GeneratedLogic({}input wire clk{});\n", in_ports_str, if out_ports.is_empty() { "".to_string() } else { format!(", {}", out_ports.join(", ")) });
+
             if !internal_wires.is_empty() { verilog_code.push_str(&format!("  wire {};\n\n", internal_wires.join(", "))); }
             if !ff_node_id.is_empty() { verilog_code.push_str("  reg Q = 1'b0;\n  wire Q_bar;\n  assign Q_bar = ~Q;\n\n"); }
-            
-            for stmt in verilog_statements { verilog_code.push_str(&format!("{}\n", stmt)); }
-            for (i, out_id) in out_nodes.iter().enumerate() { verilog_code.push_str(&format!("  assign {} = {};\n", out_headers[i], trace_math(out_id, 0, nodes, wires))); }
-
+            for stmt in assign_statements { verilog_code.push_str(&format!("{}\n", stmt)); }
             if !ff_node_id.is_empty() {
                 verilog_code.push_str("\n  always @(posedge clk) begin\n");
                 verilog_code.push_str(&format!("    Q <= {};\n", trace_math(&ff_node_id, 0, nodes, wires)));
@@ -257,20 +282,33 @@ pub extern "C" fn execute(input_len: usize) -> usize {
             }
             verilog_code.push_str("endmodule\n");
 
+            let mut math_str = String::from("Boolean Algebra:\n\n");
+            for (i, out_id) in out_nodes.iter().enumerate() {
+                math_str.push_str(&format!("Out_{} = {}\n", i, trace_math(out_id, 0, nodes, wires)));
+            }
+
             let mut custom_palette = Vec::new();
             if let Some(inputs_obj) = global_inputs.as_object() {
                 for (key, val) in inputs_obj {
                     if key.starts_with("ic_") {
-                        if let Ok(parsed_ic) = serde_json::from_str::<serde_json::Value>(val.as_str().unwrap_or("")) {
-                            let mut in_pins = Vec::new(); let mut out_pins = Vec::new();
-                            if let Some(ic_nodes) = parsed_ic.get("nodes").and_then(|n| n.as_object()) {
-                                for (_, n) in ic_nodes {
-                                    if n["value"]["name"] == "Input" { in_pins.push(n["value"].get("custom_text").and_then(|v| v.as_str()).unwrap_or("In").to_string()); }
-                                    if n["value"]["name"] == "Module OUT" { out_pins.push(n["value"].get("custom_text").and_then(|v| v.as_str()).unwrap_or("Out").to_string()); }
+                        if let Some(json_str) = val.as_str() {
+                            if let Ok(parsed_ic) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                let ic_name = key.replace("ic_", "").replace(".json", "");
+                                
+                                let mut in_count = 0; let mut out_count = 0;
+                                if let Some(ic_nodes) = parsed_ic.get("nodes").and_then(|n| n.as_object()) {
+                                    for (_, n_data) in ic_nodes {
+                                        let n_type = n_data["value"]["name"].as_str().unwrap_or("");
+                                        if n_type == "Input" { in_count += 1; }
+                                        if n_type == "Module OUT" { out_count += 1; }
+                                    }
                                 }
+                                
+                                let in_pins: Vec<String> = (0..in_count).map(|i| format!("In_{}", i)).collect();
+                                let out_pins: Vec<String> = (0..out_count).map(|i| format!("Out_{}", i)).collect();
+                                
+                                custom_palette.push(json!({ "name": ic_name, "inputs": in_pins, "outputs": out_pins }));
                             }
-                            in_pins.sort(); out_pins.sort();
-                            custom_palette.push(json!({ "name": key.replace("ic_", "").replace(".json", ""), "inputs": in_pins, "outputs": out_pins }));
                         }
                     }
                 }
@@ -280,26 +318,41 @@ pub extern "C" fn execute(input_len: usize) -> usize {
                 json!({"name": "Input", "inputs": [], "outputs": ["Out"], "show_text_input": true, "show_toggle": true}),
                 json!({"name": "Clock (clk)", "inputs": [], "outputs": ["Out"]}),
                 json!({"name": "AND Gate", "inputs": ["A", "B"], "outputs": ["Out"]}),
+                json!({"name": "NAND Gate", "inputs": ["A", "B"], "outputs": ["Out"]}),
                 json!({"name": "OR Gate", "inputs": ["A", "B"], "outputs": ["Out"]}),
+                json!({"name": "NOR Gate", "inputs": ["A", "B"], "outputs": ["Out"]}),
                 json!({"name": "XOR Gate", "inputs": ["A", "B"], "outputs": ["Out"]}),
+                json!({"name": "XNOR Gate", "inputs": ["A", "B"], "outputs": ["Out"]}),
                 json!({"name": "NOT Gate", "inputs": ["In"], "outputs": ["Out"]}),
-                json!({"name": "Module OUT", "inputs": ["Val"], "outputs": [], "show_text_input": true}) // NEW TEXT BOX HERE
+                json!({"name": "D-Flip Flop", "inputs": ["D", "clk"], "outputs": ["Q", "Q_bar"]}),
+                json!({"name": "Module OUT", "inputs": ["Val"], "outputs": []})
             ];
+            
             full_palette.extend(custom_palette);
 
-            let mut math_str = String::from("Boolean Algebra:\n\n");
-            for (i, out_id) in out_nodes.iter().enumerate() { math_str.push_str(&format!("{} = {}\n", out_headers[i], trace_math(out_id, 0, nodes, wires))); }
-
-            let blueprint = json!({
-                "type": "tabbed_studio", "host_commands": host_commands,
+            let mut blueprint = json!({
+                "type": "tabbed_studio", 
+                "host_commands": host_commands,
                 "tabs": [
-                    { "id": "canvas", "title": "🎨 Node Canvas", "type": "node_graph", "palette": full_palette },
+                    {
+                        "id": "canvas", "title": "🎨 Node Canvas", "type": "node_graph",
+                        "palette": full_palette
+                    },
                     { "id": "verilog", "title": "📝 Verilog RTL", "type": "text", "value": verilog_code },
                     { "id": "tables", "title": "📊 Data Tables", "type": "text", "value": table_content },
                     { "id": "math", "title": "🗺️ Equations", "type": "text", "value": math_str },
-                    { "id": "storage", "title": "💾 IC Storage", "type": "dashboard", "inputs": [{ "id": "save_name", "type": "text", "label": "Save Custom IC As:", "default": "" }] }
+                    { 
+                        "id": "storage", "title": "💾 IC Storage", "type": "dashboard",
+                        "inputs": [
+                            { "id": "save_name", "type": "text", "label": "Save Canvas As (e.g., HalfAdder):", "default": "" }
+                        ]
+                    }
                 ]
             });
+            
+            // To pass UI state colors back to the Host Engine
+            // The Host Engine naturally handles "active" styling via `toggle_state`. 
+            // So when you click, it's green. When you unclick, it's red.
             
             let output_json = serde_json::to_string(&blueprint).unwrap();
             let output_bytes = output_json.as_bytes();
